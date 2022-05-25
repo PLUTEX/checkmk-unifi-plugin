@@ -1,0 +1,125 @@
+#! /usr/bin/env python3
+# Copyright (C) 2021, Jan-Philipp Litza <jpl@plutex.de>.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along
+# with this program; if not, write to the Free Software Foundation, Inc.,
+# 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+
+import requests
+
+from dataclasses import dataclass
+
+from typing import Optional, Sequence
+
+from cmk.special_agents.utils.agent_common import (
+    special_agent_main,
+    SectionWriter,
+    ConditionalPiggybackSection,
+)
+from cmk.special_agents.utils.argument_parsing import (
+    Args,
+    create_default_argument_parser,
+)
+
+
+@dataclass
+class UnifiAPI:
+    hostname: str
+    port: int
+    username: str
+    password: str
+    verify: bool
+
+    def __post_init__(self):
+        self.session = requests.Session()
+
+    def _fmt_url(self, ep):
+        return f'https://{self.hostname}:{self.port}/{ep}'
+
+    def login(self):
+        r = self.session.post(
+            self._fmt_url('/api/login'),
+            json={'username': self.username, 'password': self.password},
+        )
+        r.raise_for_status()
+
+    def _get(self, ep):
+        url = self._fmt_url(ep)
+        r = self.session.get(url)
+        if r.status_code == 401:
+            self.login()
+            r = self.session.get(url)
+        r.raise_for_status()
+        return r.json()
+
+    def sites(self):
+        return self._get('/api/self/sites')
+
+    def site_device_stats(self, site_id):
+        return self._get(f'/api/s/{site_id}/stat/device')
+
+
+def parse_arguments(argv: Optional[Sequence[str]]) -> Args:
+    parser = create_default_argument_parser(description="Unifi special agent")
+    parser.add_argument(
+        '--username', '-u',
+        type=str,
+        help='username for connection',
+    )
+    parser.add_argument(
+        '--password', '-p',
+        type=str,
+        help='password for connection',
+    )
+    parser.add_argument(
+        '--port', '-P',
+        type=int,
+        default=443,
+        help='TCP port to connect to',
+    )
+    parser.add_argument('--no-cert-check', action="store_true")
+    parser.add_argument('hostname')
+    return parser.parse_args(argv)
+
+
+def agent_unifi_main(args: Args) -> None:
+    api = UnifiAPI(
+        args.hostname,
+        args.port,
+        args.username,
+        args.password,
+        not args.no_cert_check,
+    )
+    for site in api.sites()['data']:
+        for device in api.site_device_stats(site['name'])['data']:
+            try:
+                name = device['name']
+            except KeyError:
+                continue
+
+            if '.' not in name or ' ' in name:
+                continue
+
+            with ConditionalPiggybackSection(device['name']):
+                with SectionWriter('unifi') as writer:
+                    writer.append(device['state'])
+                with SectionWriter('unifi_if') as writer:
+                    writer.append_json(device.get("port_table", []))
+
+
+def main() -> None:
+    special_agent_main(parse_arguments, agent_unifi_main)
+
+
+if __name__ == '__main__':
+    main()
